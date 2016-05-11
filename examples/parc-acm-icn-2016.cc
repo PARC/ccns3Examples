@@ -178,7 +178,7 @@ CreateRepository(size_t prefixIndex)
   sprintf(buffer, "ccnx:/name=acm/name=icn/name=%06zu", prefixIndex);
   Ptr <const CCNxName> prefix = Create <CCNxName> (buffer);
 
-  Ptr <CCNxContentRepository> repo = Create <CCNxContentRepository> (prefix, 1000, 10000);
+  Ptr <CCNxContentRepository> repo = Create <CCNxContentRepository> (prefix, 100, 1);
   return repo;
 }
 
