@@ -53,6 +53,14 @@
  * contact PARC at cipo@parc.com for more information or visit http://www.ccnx.org
  */
 
+/*
+ * Simulation script to run the experiments in the PARC ccns3Sim paper submitted
+ * to ACM ICN 2016.
+ *
+ * Usage:
+ * ./waf --run parc-acm-icn-2016 --command-template="%s --seed=10 --test=[prefix_delete, link_failure, link_recovery, add_replicas] [--replicas=n]"
+ */
+
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -82,8 +90,11 @@ static Time _producerStopTime = Seconds(500);
 
 static Time _simulationStopTime = Seconds(50);
 
-static Time _linkFailureTime = Seconds(33);
-static Time _statsReportTime = Seconds(38);
+// The time at which we measure the stats to capture initialization cost
+static Time _initTime = Seconds(12);
+
+static Time _testStartTime = Seconds(33);
+static Time _testStopTime = Seconds(38);
 
 static Time _helloInterval = Seconds(1);
 static Time _neighborTimeout = Seconds(3); // 3 missed hellos
@@ -94,54 +105,142 @@ static UniformRandomVariable _uniformRandomVariable;
 
 typedef std::vector< NetDeviceContainer > DevicePairsListType;
 
+enum TimeSeriesEvents {
+  EVENT_INIT = 0,
+  EVENT_TEST_START = 1,
+  EVENT_TEST_FINISH = 2,
+  EVENT_SIM_FINISH = 3
+};
+
+static std::vector< NfpComputationCost > _costTimeSeries;
+static std::vector< NfpStats > _statsTimeSeries;
+
+typedef enum {
+  TEST_LINK_FAILURE,
+  TEST_LINK_RECOVERY,
+  TEST_PREFIX_DELETE,
+  TEST_ADD_REPLICAS,
+  TEST_UNKNOWN
+} TestType;
+
+static struct {
+  TestType	testType;
+  std::string	argument;
+} testStringToType[] = {
+    { TEST_LINK_FAILURE, "link_failure" },
+    { TEST_LINK_RECOVERY, "link_recovery" },
+    { TEST_PREFIX_DELETE, "prefix_delete" },
+    { TEST_ADD_REPLICAS, "add_replicas" },
+    { TEST_UNKNOWN, "" },
+};
+
+static TestType
+TestStringToType(std::string s)
+{
+  for (int i = 0; testStringToType[i].testType != TEST_UNKNOWN; ++i) {
+      if (s == testStringToType[i].argument) {
+	  return testStringToType[i].testType;
+      }
+  }
+  return TEST_UNKNOWN;
+}
+
+// ================
+// Test configuration
+
+typedef struct {
+  std::string inputFileName;
+  unsigned anchorCount;
+  unsigned prefixCount;
+  unsigned replicaCount;	// used for the add_replicas test
+  uint64_t seed;
+  bool detailed;
+  TestType testType;
+
+  std::vector< Ptr<Node> > anchors;
+  ApplicationContainer apps;
+} TestData;
+
+static TestData _testData;
+
+// ================
+
 /*
  * A vector that lists each pair of devices that make up a PPP link.  When we want to
  * fail a link, we pick a random entry from the vector and then fail each device on the link.
  */
 static DevicePairsListType _links;
 
+static Ptr <CCNxContentRepository>
+CreateRepository(size_t prefixIndex)
+{
+  char buffer[255];
+  sprintf(buffer, "ccnx:/name=acm/name=icn/name=%06zu", prefixIndex);
+  Ptr <const CCNxName> prefix = Create <CCNxName> (buffer);
 
-static ApplicationContainer
+  Ptr <CCNxContentRepository> repo = Create <CCNxContentRepository> (prefix, 1000, 10000);
+  return repo;
+}
+
+/**
+ * Adds a producer to an anchor.  It will use 'prefixIndex' as part of the repository name.
+ *
+ * @param prefixIndex
+ */
+static void
+AddProducerToAnchor(size_t anchorIndex, Ptr <CCNxContentRepository> repo, Time start, Time stop)
+{
+  CCNxProducerHelper producerHelper (repo);
+  ApplicationContainer producerApps = producerHelper.Install (_testData.anchors[anchorIndex]);
+  producerApps.Start (start);
+  producerApps.Stop (stop);
+  _testData.apps.Add(producerApps);
+
+  if (_testData.detailed) {
+      std::cout << "Producer " << *repo->GetRepositoryPrefix() << " assigned to anchor " << _testData.anchors[anchorIndex]->GetId() << std::endl;
+  }
+}
+
+static void
 AssignProducers(CCNxStackHelper &stackHelper, NodeContainer &nodes, int anchorCount, int prefixCount)
 {
-  ApplicationContainer allApps;
 
   if (nodes.GetN() < anchorCount) {
       std::cout << "Not enough nodes for the number of anchors" << std::endl;
-      return allApps;
+      return;
   }
 
   // pick the random anchors
-  std::vector< Ptr<Node> > anchors;
-  while (anchors.size() < anchorCount) {
-      int anchorIndex = random() % nodes.GetN();
+  while (_testData.anchors.size() < anchorCount) {
+      int anchorIndex = _uniformRandomVariable.GetInteger(0, nodes.GetN()-1);
       Ptr<Node> node = nodes.Get(anchorIndex);
 
-      std::vector< Ptr<Node> >::iterator i = find(anchors.begin(), anchors.end(), node);
-      if (i == anchors.end()) {
-	  anchors.push_back(node);
+      std::vector< Ptr<Node> >::iterator i = find(_testData.anchors.begin(), _testData.anchors.end(), node);
+      if (i == _testData.anchors.end()) {
+	  _testData.anchors.push_back(node);
       }
   }
 
-  Ptr <const CCNxName> prefix = Create <CCNxName> ("ccnx:/name=ccnx/name=consumer/name=producer");
-  for (int i = 0; i < prefixCount; i++) {
-      char buffer[255];
-      sprintf(buffer, "ccnx:/name=acm/name=icn/name=%04u", i);
-      Ptr <const CCNxName> prefix = Create <CCNxName> (buffer);
-
-      Ptr <CCNxContentRepository> globalContentRepository = Create <CCNxContentRepository> (prefix, 1000, 10000);
-
-      int anchorIndex = random() % anchors.size();
-      CCNxProducerHelper producerHelper (globalContentRepository);
-      ApplicationContainer producerApps = producerHelper.Install (anchors[anchorIndex]);
-      producerApps.Start (_producerStartTime);
-      producerApps.Stop (_producerStopTime);
-      allApps.Add(producerApps);
-
-      std::cout << "Producer " << i << " assigned to anchor " << anchors[anchorIndex]->GetId() << std::endl;
+  int prefixDeleteIndex = -1;
+  if (_testData.testType == TEST_PREFIX_DELETE) {
+      // The selected prefix will stop advertising at _testStopTime, instead of the normal _producerStopTime
+      prefixDeleteIndex = _uniformRandomVariable.GetInteger(0, prefixCount-1);
+      std::cerr << "Prefix delete index " << prefixDeleteIndex << std::endl;
   }
 
-  return  allApps;
+  for (int prefixIndex = 0; prefixIndex < prefixCount; prefixIndex++) {
+      Ptr <CCNxContentRepository> repo = CreateRepository(prefixIndex);
+
+      for (int replica = 0; replica < _testData.replicaCount; replica++) {
+	int anchorIndex = _uniformRandomVariable.GetInteger(0, _testData.anchors.size() - 1);
+
+	if (prefixDeleteIndex == prefixIndex && replica == 0) {
+	    AddProducerToAnchor(anchorIndex, repo, _producerStartTime, _testStopTime);
+	} else {
+	    AddProducerToAnchor(anchorIndex, repo, _producerStartTime, _producerStopTime);
+	}
+      }
+  }
 }
 
 
@@ -203,7 +302,9 @@ ReadFile(std::string inputFileName, CCNxStackHelper &ccnxStack)
 	      src = CreateObject<Node>();
 	      nodeTable[entry.srcName] = src;
 	      nodes.Add(src);
-	      std::cout << "Add node " << entry.srcName << " id " << src->GetId() << std::endl;
+	      if (_testData.detailed) {
+		  std::cout << "Add node " << entry.srcName << " id " << src->GetId() << std::endl;
+	      }
 	  }
 
 	  Ptr<Node> dst = nodeTable[entry.dstName];
@@ -211,7 +312,9 @@ ReadFile(std::string inputFileName, CCNxStackHelper &ccnxStack)
 	      dst = CreateObject<Node>();
 	      nodeTable[entry.dstName] = dst;
 	      nodes.Add(dst);
-	      std::cout << "Add node " << entry.dstName << " id " << dst->GetId() << std::endl;
+	      if (_testData.detailed) {
+		  std::cout << "Add node " << entry.dstName << " id " << dst->GetId() << std::endl;
+	      }
 	  }
 
 	  PointToPointHelper ppp;
@@ -223,7 +326,9 @@ ReadFile(std::string inputFileName, CCNxStackHelper &ccnxStack)
 	  devices.Add(devpair);
 	  _links.push_back(devpair);
 
-	  std::cout << "linkid " << _links.size() -1 << " : " << entry.srcName << " <-> " << entry.dstName << std::endl;
+	  if (_testData.detailed) {
+	      std::cout << "linkid " << _links.size() -1 << " : " << entry.srcName << " <-> " << entry.dstName << std::endl;
+	  }
 
       }
     }
@@ -243,6 +348,7 @@ Progress(Time interval)
   Simulator::Schedule (interval, &Progress, interval);
 }
 
+__attribute__((unused))
 static void
 ReportStats(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHelper)
 {
@@ -255,15 +361,41 @@ ReportStats(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standar
   }
 }
 
+/**
+ * Calculate the total, network-wide computation cost from time 0 to now.
+ * Will append the cost in _costTimeSeries[], so one can look at the deltas between
+ * calls to this function.
+ *
+ * @param trace [in] The output stream to write the results to
+ * @param nfpHelper [in] The NFP helper to query for the total
+ */
 static void
 ReportComputationCost(Ptr<OutputStreamWrapper> trace, NfpRoutingHelper &nfpHelper)
 {
   NodeContainer nodes = NodeContainer::GetGlobal();
 
+  NfpComputationCost costTotal;
+  NfpStats statsTotal;
+
   for (int i = 0; i < nodes.GetN(); ++i) {
       Ptr<Node> node = nodes.Get(i);
-      nfpHelper.PrintComputationCost(trace, node);
+      costTotal += nfpHelper.GetComputationCost(node);
+      statsTotal += nfpHelper.GetStats(node);
   }
+
+  std::ostream *os = trace->GetStream();
+
+  ns3::LogTimePrinter timePrinter = ns3::LogGetTimePrinter ();
+  (*timePrinter)(*os);
+  *os << " Total Computation Cost " << costTotal;
+  *os << " Messages Sent " << statsTotal.GetAdvertiseSent() + statsTotal.GetWithdrawSent();
+  *os << " Packets Sent " << statsTotal.GetPayloadsSent();
+  *os << std::endl;
+
+  *os << statsTotal << std::endl;
+
+  _costTimeSeries.push_back(costTotal);
+  _statsTimeSeries.push_back(statsTotal);
 }
 
 /*
@@ -273,14 +405,14 @@ static unsigned
 PickLinkToFail()
 {
   // pick a node, then pick a device on that node
-  unsigned linkIndex = random() % _links.size();
+  unsigned linkIndex = _uniformRandomVariable.GetInteger(0, _links.size()-1);
   return linkIndex;
 }
 
 static void
 FailLink(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHelper, NfpRoutingHelper &nfpHelper)
 {
-  LogComponentEnable ("NfpRoutingProtocol", (LogLevel) (LOG_LEVEL_WARN | LOG_PREFIX_ALL ));
+  LogComponentEnable ("NfpRoutingProtocol", (LogLevel) (LOG_LEVEL_INFO | LOG_PREFIX_ALL ));
 
   ns3::LogTimePrinter timePrinter = ns3::LogGetTimePrinter ();
   (*timePrinter)(std::cout);
@@ -291,7 +423,7 @@ FailLink(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHe
 
   int linkIndex = PickLinkToFail();
 
-  std::cout << "Failing link index " << linkIndex << std::endl;
+  std::cerr << "Failing link index " << linkIndex << std::endl;
 
   Ptr<RateErrorModel> em = CreateObject<RateErrorModel>();
   em->SetRate(1.0);
@@ -309,7 +441,7 @@ FailLink(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHe
 }
 
 static void
-FailureFinished(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHelper, NfpRoutingHelper &nfpHelper)
+TestFinished(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHelper, NfpRoutingHelper &nfpHelper)
 {
   ns3::LogTimePrinter timePrinter = ns3::LogGetTimePrinter ();
   (*timePrinter)(std::cout);
@@ -317,12 +449,71 @@ FailureFinished(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &sta
 
   ReportComputationCost(trace, nfpHelper);
 
-  // LogComponentEnable ("NfpRoutingProtocol", (LogLevel) (LOG_LEVEL_INFO | LOG_PREFIX_ALL ));
+  LogComponentDisable("NfpRoutingProtocol", LOG_LEVEL_ALL);
+  LogComponentEnable ("NfpRoutingProtocol", (LogLevel) (LOG_LEVEL_ERROR | LOG_PREFIX_ALL ));
+
+  LogComponentDisable("CCNxStandardForwarder", LOG_LEVEL_ALL);
+  LogComponentEnable ("CCNxStandardForwarder", (LogLevel) (LOG_LEVEL_ERROR | LOG_PREFIX_ALL ));
 }
 
+static void
+AddReplicas(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHelper, NfpRoutingHelper &nfpHelper)
+{
+  LogComponentEnable ("NfpRoutingProtocol", (LogLevel) (LOG_LEVEL_WARN | LOG_PREFIX_ALL ));
 
+  // report the current computation costs so we can subtract that out later
+  ReportComputationCost(trace, nfpHelper);
+
+	// we need to create the producer apps at time 0 and scheudle them to start at the test time
+	Ptr <CCNxContentRepository> repo = CreateRepository(_testData.prefixCount + 2);
+	for (int i = 0; i < _testData.replicaCount; i++) {
+	    int anchorIndex = _uniformRandomVariable.GetInteger(0, _testData.anchors.size()-1);
+	    // stop them at the end of the simulation, not during the measurement period as we only
+	    // want to measure adding replicas, not removing them.
+	    AddProducerToAnchor(anchorIndex, repo, _testStartTime, _producerStopTime);
+	}
+}
+
+static void
+PrefixDelete(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHelper, NfpRoutingHelper &nfpHelper)
+{
+  LogComponentEnable ("NfpRoutingProtocol", (LogLevel) (LOG_LEVEL_WARN | LOG_PREFIX_ALL ));
+
+  // report the current computation costs so we can subtract that out later
+  ReportComputationCost(trace, nfpHelper);
+
+  // The producer stop time for the selected anchor was set in the AssignProducersToAnchors() call
+}
+
+static void
+ScheduleTest(Ptr<OutputStreamWrapper> trace, CCNxStandardForwarderHelper &standardHelper, NfpRoutingHelper &nfpHelper)
+{
+  switch (_testData.testType)
+  {
+    case TEST_LINK_FAILURE:
+      // schedule the link failure and then the stats reporting after converged
+      Simulator::Schedule (_testStartTime, &FailLink, trace, standardHelper, nfpHelper);
+      Simulator::Schedule (_testStopTime, &TestFinished, trace, standardHelper, nfpHelper);
+      break;
+
+    case TEST_ADD_REPLICAS:
+      // schedule the link failure and then the stats reporting after converged
+      Simulator::Schedule (_testStartTime, &AddReplicas, trace, standardHelper, nfpHelper);
+      Simulator::Schedule (_testStopTime, &TestFinished, trace, standardHelper, nfpHelper);
+      break;
+
+    case TEST_PREFIX_DELETE:
+      // schedule the link failure and then the stats reporting after converged
+      Simulator::Schedule (_testStartTime, &PrefixDelete, trace, standardHelper, nfpHelper);
+      Simulator::Schedule (_testStopTime, &TestFinished, trace, standardHelper, nfpHelper);
+      break;
+
+    default:
+      NS_ASSERT_MSG(false, "Unimplemented test type " << _testData.testType);
+  }
+}
 void
-RunSimulation (std::string inputFileName, int anchorCount, int prefixCount, uint64_t seed)
+RunSimulation ()
 {
   LogComponentEnableAll (LOG_PREFIX_ALL);
   LogComponentEnable ("CCNxStandardLayer3", LOG_LEVEL_WARN);
@@ -360,21 +551,22 @@ RunSimulation (std::string inputFileName, int anchorCount, int prefixCount, uint
   ccnxStack.SetRoutingHelper (nfpHelper);
 
   // This will call ccnxStack.Install(), so make sure all the other helpers are specified before here.
-  NodeContainer nodes = ReadFile(inputFileName, ccnxStack);
+  NodeContainer nodes = ReadFile(_testData.inputFileName, ccnxStack);
 
   // Requires that NFP be installed on nodes, so after ccnxStack.Install()
-  seed += nfpHelper.SetSteams(nodes, seed);
+  _testData.seed += nfpHelper.SetSteams(nodes, _testData.seed);
 
-  ApplicationContainer apps = AssignProducers(ccnxStack, nodes, anchorCount, prefixCount);
+  AssignProducers(ccnxStack, nodes, _testData.anchorCount, _testData.prefixCount);
 
   Simulator::Stop (_simulationStopTime); // Allow an extra second for simulator to complete shutdown.
 
   // periodic status
-  Simulator::Schedule (Seconds (1), &Progress, Seconds(1));
+  Simulator::Schedule (Seconds (10), &Progress, Seconds(10));
 
-  // schedule the link failure and then the stats reporting after converged
-  Simulator::Schedule (_linkFailureTime, &FailLink, trace, standardHelper, nfpHelper);
-  Simulator::Schedule (_statsReportTime, &FailureFinished, trace, standardHelper, nfpHelper);
+  // The stats after initialization
+  Simulator::Schedule (_initTime, &TestFinished, trace, standardHelper, nfpHelper);
+
+  ScheduleTest(trace, standardHelper, nfpHelper);
 
   std::cout << "*** starting simulation ***" << std::endl;
 
@@ -382,8 +574,31 @@ RunSimulation (std::string inputFileName, int anchorCount, int prefixCount, uint
 
   std::cout << "*** finishing simulation ***" << std::endl;
 
-  ReportStats(trace, standardHelper);
+//  ReportStats(trace, standardHelper);
   ReportComputationCost(trace, nfpHelper);
+
+  uint64_t costDelta = _costTimeSeries[EVENT_TEST_FINISH].GetTotalCost() - _costTimeSeries[EVENT_TEST_START].GetTotalCost();
+  uint64_t messagesDelta = _statsTimeSeries[EVENT_TEST_FINISH].GetAdvertiseSent() + _statsTimeSeries[EVENT_TEST_FINISH].GetWithdrawSent() -
+      _statsTimeSeries[EVENT_TEST_START].GetAdvertiseSent() - _statsTimeSeries[EVENT_TEST_START].GetWithdrawSent();
+  uint64_t packetsDelta = _statsTimeSeries[EVENT_TEST_FINISH].GetPayloadsSent() - _statsTimeSeries[EVENT_TEST_START].GetPayloadsSent();
+  uint64_t helloDelta = _statsTimeSeries[EVENT_TEST_FINISH].GetHellosSent() - _statsTimeSeries[EVENT_TEST_START].GetHellosSent();
+
+  std::cout << std::endl << "Delta comp " << costDelta;
+  std::cout << " msgs " << messagesDelta;
+  std::cout << " hellos " << helloDelta;
+  std::cout << " pkts " << packetsDelta;
+
+  std::cout << " Init comp " << _costTimeSeries[EVENT_INIT].GetTotalCost();
+  std::cout << " msgs " << _statsTimeSeries[EVENT_INIT].GetAdvertiseSent() + _statsTimeSeries[EVENT_INIT].GetWithdrawSent();
+  std::cout << " hellos " << _statsTimeSeries[EVENT_INIT].GetHellosSent();
+  std::cout << " pkts " << _statsTimeSeries[EVENT_INIT].GetPayloadsSent();
+
+  std::cout << " Total comp " << _costTimeSeries[EVENT_SIM_FINISH].GetTotalCost();
+  std::cout << " msgs " << _statsTimeSeries[EVENT_SIM_FINISH].GetAdvertiseSent() + _statsTimeSeries[EVENT_SIM_FINISH].GetWithdrawSent();
+  std::cout << " hellos " << _statsTimeSeries[EVENT_SIM_FINISH].GetHellosSent();
+  std::cout << " pkts " << _statsTimeSeries[EVENT_SIM_FINISH].GetPayloadsSent();
+
+  std::cout << std::endl;
 
   Simulator::Destroy ();
 }
@@ -391,20 +606,32 @@ RunSimulation (std::string inputFileName, int anchorCount, int prefixCount, uint
 int
 main (int argc, char *argv[])
 {
-  std::string input ("topo.txt");
-  unsigned anchors = 30;
-  std::string prefixes ("210");
-  uint64_t seed = time(NULL);
+  _testData.inputFileName = "topo.txt";
+  _testData.anchorCount = 30;
+  _testData.prefixCount = 210;
+  _testData.replicaCount = 1;
+  _testData.seed = time(NULL);
+  _testData.detailed = false;
+  _testData.testType = TEST_UNKNOWN;
+
+  std::string testTypeString = "unknown";
 
   CommandLine cmd;
-  cmd.AddValue ("input", "Name of the input file.", input);
-  cmd.AddValue ("anchors", "Anchor count", anchors);
-  cmd.AddValue ("seed", "Random number seed.", seed);
+  cmd.AddValue ("input", "Name of the input file.", _testData.inputFileName);
+  cmd.AddValue ("test", "prefix_delete | link_failure | link_recovery | add_replicas", testTypeString);
+  cmd.AddValue ("anchors", "Anchor count", _testData.anchorCount);
+  cmd.AddValue ("prefixes", "Prefix count", _testData.prefixCount);
+  cmd.AddValue ("replicas", "Replica count", _testData.replicaCount);
+  cmd.AddValue ("seed", "Random number seed.", _testData.seed);
+  cmd.AddValue ("detailed", "Print detailed information", _testData.detailed);
   cmd.Parse (argc, argv);
 
-  _uniformRandomVariable.SetStream(seed);
-  seed++;
+  _testData.testType = TestStringToType(testTypeString);
+  NS_ASSERT_MSG(_testData.testType != TEST_UNKNOWN, "Unknown test type " << testTypeString << ", see --help");
 
-  RunSimulation (input, anchors, atoi(prefixes.c_str()), seed);
+  _uniformRandomVariable.SetStream(_testData.seed);
+  _testData.seed++;
+
+  RunSimulation ();
   return 0;
 }

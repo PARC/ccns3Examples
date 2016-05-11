@@ -56,7 +56,7 @@
 def build(bld):
 	####
     obj = bld.create_ns3_program('parc-acm-icn-2016',
-                                 ['network', 'ccns3Sim', 'applications', 'csma', 'point-to-point'])
+                                 ['network', 'ccns3Sim', 'ccns3Examples', 'applications', 'csma', 'point-to-point'])
     obj.source = 'parc-acm-icn-2016.cc'
     
    	####
