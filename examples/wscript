@@ -59,6 +59,11 @@ def build(bld):
                                  ['network', 'ccns3Sim', 'ccns3Examples', 'applications', 'csma', 'point-to-point'])
     obj.source = 'parc-acm-icn-2016.cc'
     
+	####
+    obj = bld.create_ns3_program('large-consumer-producer',
+                                 ['network', 'ccns3Sim', 'ccns3Examples', 'applications', 'csma', 'point-to-point'])
+    obj.source = 'large-consumer-producer.cc'
+    
    	####
     obj = bld.create_ns3_program('acme-forwarder',
                                  ['network', 'ccns3Sim', 'ccns3Examples', 'applications', 'csma', 'point-to-point'])
