@@ -54,11 +54,10 @@
  */
 
 /*
- * Simulation script to run the experiments in the PARC ccns3Sim paper submitted
- * to ACM ICN 2016.
+ * Simulation script to run the experiments in the PARC ccns3Sim paper.
  *
  * Usage:
- * ./waf --run parc-acm-icn-2016 --command-template="%s --seed=10 --test=[prefix_delete, link_failure, link_recovery, add_replicas] [--replicas=n]"
+ * ./waf --run larce-consumer-producer --command-template="%s --seed=10 --test=[prefix_delete, link_failure, link_recovery, add_replicas] [--replicas=n]"
  */
 
 #include <iostream>
